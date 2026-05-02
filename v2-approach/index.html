@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Turn-Based 2D Movement Planner</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      --bg-a: #08111f;
+      --bg-b: #102542;
+      --panel: rgba(8, 17, 31, 0.8);
+      --panel-border: rgba(148, 163, 184, 0.2);
+      --text: #e5eefc;
+      --muted: #98a7bf;
+      --accent: #22d3ee;
+      --ship: #f97316;
+      --ship-edge: #fdba74;
+      --velocity: #fb7185;
+      --direction: #a3e635;
+      --preview: #67e8f9;
+      --button: #0ea5e9;
+      --button-hover: #38bdf8;
+      --button-disabled: #475569;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      font-family: "Trebuchet MS", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at top, rgba(14, 165, 233, 0.12), transparent 30%),
+        linear-gradient(180deg, var(--bg-a), var(--bg-b));
+    }
+
+    canvas {
+      display: block;
+      width: 100vw;
+      height: 100vh;
+    }
+
+    .hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      width: min(360px, calc(100vw - 32px));
+      padding: 16px;
+      border: 1px solid var(--panel-border);
+      border-radius: 8px;
+      background: var(--panel);
+      backdrop-filter: blur(10px);
+      box-shadow: 0 18px 36px rgba(0, 0, 0, 0.2);
+    }
+
+    .hud h1 {
+      margin: 0 0 8px;
+      font-size: 18px;
+    }
+
+    .hud p {
+      margin: 0 0 12px;
+      font-size: 14px;
+      color: var(--muted);
+      line-height: 1.45;
+    }
+
+    .info-row {
+      margin-bottom: 6px;
+      font-size: 13px;
+    }
+
+    .swatch {
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      margin-right: 6px;
+      border-radius: 999px;
+      vertical-align: middle;
+    }
+
+    button {
+      width: 100%;
+      margin-top: 12px;
+      padding: 11px 14px;
+      border: 0;
+      border-radius: 8px;
+      background: var(--button);
+      color: white;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background 140ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      background: var(--button-hover);
+    }
+
+    button:disabled {
+      background: var(--button-disabled);
+      cursor: not-allowed;
+    }
+
+    code {
+      font-family: Consolas, monospace;
+      color: white;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="canvas"></canvas>
+
+  <div class="hud">
+    <h1>Turn Planner</h1>
+    <p><code>Left / Right</code> rotate the planned turn, <code>Up</code> adds thrust to the planned turn, and <code>End Turn</code> plays back the exact simulated result.</p>
+    <div class="info-row">Phase: <span id="phaseLabel">Planning</span></div>
+    <div class="info-row">Speed: <span id="speedLabel">0.00</span></div>
+    <div class="info-row">Effective rotation: <span id="rotationLabel">0.00</span> rad/s</div>
+    <div class="info-row"><span class="swatch" style="background: var(--preview)"></span>Trajectory preview</div>
+    <div class="info-row"><span class="swatch" style="background: var(--velocity)"></span>Velocity vector</div>
+    <div class="info-row"><span class="swatch" style="background: var(--direction)"></span>Facing direction</div>
+    <button id="endTurnButton" type="button">End Turn</button>
+  </div>
+
+  <script>
+    const canvas = document.getElementById("canvas");
+    const ctx = canvas.getContext("2d");
+    const phaseLabel = document.getElementById("phaseLabel");
+    const speedLabel = document.getElementById("speedLabel");
+    const rotationLabel = document.getElementById("rotationLabel");
+    const endTurnButton = document.getElementById("endTurnButton");
+
+    // Required movement parameters.
+    const thrust = 120;
+    const drag = 0.985;
+    const rotationSpeed = 3.0;
+    const dt = 0.016;
+    const steps = 50;
+
+    // Required curvature control parameters.
+    const curvatureFactor = 2.5;
+    const minSpeed = 20;
+    const velocityScale = 0.35;
+    const facingLength = 56;
+
+    const phase = {
+      PLANNING: "planning",
+      EXECUTING: "executing",
+    };
+
+    const state = {
+      x: 0,
+      y: 0,
+      vx: 150,
+      vy: -20,
+      angle: -Math.PI / 8,
+    };
+
+    const input = {
+      left: false,
+      right: false,
+      thrust: false,
+    };
+
+    let currentPhase = phase.PLANNING;
+    let executionFrames = [];
+    let executionIndex = 0;
+    let executionAccumulator = 0;
+    let renderedState = { ...state };
+    let lastFrameTime = 0;
+
+    function resizeCanvas() {
+      canvas.width = window.innerWidth;
+      canvas.height = window.innerHeight;
+
+      if (state.x === 0 && state.y === 0) {
+        state.x = canvas.width * 0.5;
+        state.y = canvas.height * 0.5;
+        renderedState = { ...state };
+      }
+    }
+
+    window.addEventListener("resize", resizeCanvas);
+    resizeCanvas();
+
+    function cloneState(source) {
+      return {
+        x: source.x,
+        y: source.y,
+        vx: source.vx,
+        vy: source.vy,
+        angle: source.angle,
+      };
+    }
+
+    function getSpeed(targetState) {
+      return Math.sqrt(targetState.vx * targetState.vx + targetState.vy * targetState.vy);
+    }
+
+    function getEffectiveRotation(targetState) {
+      const speed = getSpeed(targetState);
+      const speedFloor = Math.max(speed, minSpeed);
+      const maxCurvature = curvatureFactor / speedFloor;
+
+      // This converts the curvature limit into a speed-aware turn cap so high-speed motion bends wider.
+      return Math.min(rotationSpeed, maxCurvature * minSpeed);
+    }
+
+    // Shared fixed-step physics used by both real execution and trajectory prediction.
+    function stepPhysics(targetState, currentInput, dtValue) {
+      const effectiveRotation = getEffectiveRotation(targetState);
+
+      if (currentInput.left) {
+        targetState.angle -= effectiveRotation * dtValue;
+      }
+
+      if (currentInput.right) {
+        targetState.angle += effectiveRotation * dtValue;
+      }
+
+      if (currentInput.thrust) {
+        targetState.vx += Math.cos(targetState.angle) * thrust * dtValue;
+        targetState.vy += Math.sin(targetState.angle) * thrust * dtValue;
+      }
+
+      targetState.vx *= drag;
+      targetState.vy *= drag;
+      targetState.x += targetState.vx * dtValue;
+      targetState.y += targetState.vy * dtValue;
+    }
+
+    // Required movement update function.
+    function update(targetState, currentInput, dtValue) {
+      stepPhysics(targetState, currentInput, dtValue);
+    }
+
+    function simulateTurn(startState, currentInput) {
+      const simState = cloneState(startState);
+      const snapshots = [];
+
+      for (let i = 0; i < steps; i += 1) {
+        update(simState, currentInput, dt);
+        snapshots.push(cloneState(simState));
+      }
+
+      return {
+        snapshots,
+        finalState: cloneState(simState),
+      };
+    }
+
+    // Required trajectory prediction function using the identical deterministic simulation logic.
+    function getTrajectory(startState, currentInput) {
+      const simResult = simulateTurn(startState, currentInput);
+      return simResult.snapshots.map((snapshot) => ({ x: snapshot.x, y: snapshot.y }));
+    }
+
+    function wrapAround(targetState) {
+      const padding = 28;
+
+      if (targetState.x < -padding) {
+        targetState.x = canvas.width + padding;
+      } else if (targetState.x > canvas.width + padding) {
+        targetState.x = -padding;
+      }
+
+      if (targetState.y < -padding) {
+        targetState.y = canvas.height + padding;
+      } else if (targetState.y > canvas.height + padding) {
+        targetState.y = -padding;
+      }
+    }
+
+    function updateHud(referenceState) {
+      phaseLabel.textContent = currentPhase === phase.PLANNING ? "Planning" : "Execution";
+      speedLabel.textContent = getSpeed(referenceState).toFixed(2);
+      rotationLabel.textContent = getEffectiveRotation(referenceState).toFixed(2);
+      endTurnButton.disabled = currentPhase !== phase.PLANNING;
+    }
+
+    function drawGrid() {
+      const spacing = 48;
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.12)";
+      ctx.lineWidth = 1;
+
+      for (let x = 0; x <= canvas.width; x += spacing) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, canvas.height);
+        ctx.stroke();
+      }
+
+      for (let y = 0; y <= canvas.height; y += spacing) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(canvas.width, y);
+        ctx.stroke();
+      }
+    }
+
+    function drawTrajectory(points) {
+      if (points.length === 0) {
+        return;
+      }
+
+      ctx.beginPath();
+      ctx.moveTo(state.x, state.y);
+
+      for (const point of points) {
+        ctx.lineTo(point.x, point.y);
+      }
+
+      ctx.strokeStyle = "rgba(103, 232, 249, 0.95)";
+      ctx.lineWidth = 2.5;
+      ctx.stroke();
+
+      for (const point of points) {
+        ctx.beginPath();
+        ctx.arc(point.x, point.y, 2.8, 0, Math.PI * 2);
+        ctx.fillStyle = "rgba(103, 232, 249, 0.88)";
+        ctx.fill();
+      }
+    }
+
+    function drawDebugVectors(targetState) {
+      // Velocity vector for debugging momentum and drag.
+      ctx.beginPath();
+      ctx.moveTo(targetState.x, targetState.y);
+      ctx.lineTo(
+        targetState.x + targetState.vx * velocityScale,
+        targetState.y + targetState.vy * velocityScale
+      );
+      ctx.strokeStyle = "#fb7185";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+
+      // Facing vector for debugging thrust direction and planned rotation.
+      ctx.beginPath();
+      ctx.moveTo(targetState.x, targetState.y);
+      ctx.lineTo(
+        targetState.x + Math.cos(targetState.angle) * facingLength,
+        targetState.y + Math.sin(targetState.angle) * facingLength
+      );
+      ctx.strokeStyle = "#a3e635";
+      ctx.lineWidth = 3;
+      ctx.stroke();
+    }
+
+    function drawRectangle(targetState) {
+      ctx.save();
+      ctx.translate(targetState.x, targetState.y);
+      ctx.rotate(targetState.angle);
+      ctx.fillStyle = "#f97316";
+      ctx.strokeStyle = "#fdba74";
+      ctx.lineWidth = 2;
+
+      ctx.beginPath();
+      ctx.rect(-24, -14, 48, 28);
+      ctx.fill();
+      ctx.stroke();
+
+      ctx.beginPath();
+      ctx.moveTo(25, 0);
+      ctx.lineTo(10, -8);
+      ctx.lineTo(10, 8);
+      ctx.closePath();
+      ctx.fillStyle = "#ffedd5";
+      ctx.fill();
+      ctx.restore();
+    }
+
+    function setPlanningPhase() {
+      currentPhase = phase.PLANNING;
+      executionFrames = [];
+      executionIndex = 0;
+      executionAccumulator = 0;
+      renderedState = cloneState(state);
+      input.left = false;
+      input.right = false;
+      input.thrust = false;
+    }
+
+    function beginExecution() {
+      if (currentPhase !== phase.PLANNING) {
+        return;
+      }
+
+      const simResult = simulateTurn(state, input);
+
+      if (simResult.snapshots.length === 0) {
+        return;
+      }
+
+      currentPhase = phase.EXECUTING;
+      executionFrames = simResult.snapshots;
+      executionIndex = 0;
+      executionAccumulator = 0;
+      renderedState = cloneState(state);
+    }
+
+    endTurnButton.addEventListener("click", beginExecution);
+
+    function onKeyChange(event, isPressed) {
+      if (currentPhase !== phase.PLANNING) {
+        return;
+      }
+
+      switch (event.code) {
+        case "ArrowLeft":
+        case "KeyA":
+          input.left = isPressed;
+          break;
+        case "ArrowRight":
+        case "KeyD":
+          input.right = isPressed;
+          break;
+        case "ArrowUp":
+        case "KeyW":
+          input.thrust = isPressed;
+          break;
+        default:
+          return;
+      }
+
+      event.preventDefault();
+    }
+
+    window.addEventListener("keydown", (event) => onKeyChange(event, true));
+    window.addEventListener("keyup", (event) => onKeyChange(event, false));
+
+    function lerpState(fromState, toState, alpha) {
+      return {
+        x: fromState.x + (toState.x - fromState.x) * alpha,
+        y: fromState.y + (toState.y - fromState.y) * alpha,
+        vx: fromState.vx + (toState.vx - fromState.vx) * alpha,
+        vy: fromState.vy + (toState.vy - fromState.vy) * alpha,
+        angle: fromState.angle + (toState.angle - fromState.angle) * alpha,
+      };
+    }
+
+    function finishExecution() {
+      const finalState = executionFrames[executionFrames.length - 1];
+
+      state.x = finalState.x;
+      state.y = finalState.y;
+      state.vx = finalState.vx;
+      state.vy = finalState.vy;
+      state.angle = finalState.angle;
+      wrapAround(state);
+      renderedState = cloneState(state);
+      setPlanningPhase();
+    }
+
+    function advanceExecution(frameDt) {
+      if (currentPhase !== phase.EXECUTING) {
+        return;
+      }
+
+      executionAccumulator += frameDt;
+
+      while (executionAccumulator >= dt && currentPhase === phase.EXECUTING) {
+        executionAccumulator -= dt;
+        executionIndex += 1;
+
+        if (executionIndex >= executionFrames.length) {
+          finishExecution();
+          return;
+        }
+      }
+
+      const previousState = executionIndex === 0 ? state : executionFrames[executionIndex - 1];
+      const nextState = executionFrames[executionIndex];
+      const alpha = Math.min(executionAccumulator / dt, 1);
+      renderedState = lerpState(previousState, nextState, alpha);
+    }
+
+    // Render loop for planning preview and execution playback.
+    function render(timestamp) {
+      if (lastFrameTime === 0) {
+        lastFrameTime = timestamp;
+      }
+
+      const frameDt = Math.min((timestamp - lastFrameTime) / 1000, 0.05);
+      lastFrameTime = timestamp;
+
+      if (currentPhase === phase.EXECUTING) {
+        advanceExecution(frameDt);
+      }
+
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      drawGrid();
+
+      if (currentPhase === phase.PLANNING) {
+        const trajectory = getTrajectory(state, input);
+        drawTrajectory(trajectory);
+        drawDebugVectors(state);
+        drawRectangle(state);
+        updateHud(state);
+      } else {
+        drawTrajectory(executionFrames.map((frame) => ({ x: frame.x, y: frame.y })));
+        drawDebugVectors(renderedState);
+        drawRectangle(renderedState);
+        updateHud(renderedState);
+      }
+
+      requestAnimationFrame(render);
+    }
+
+    requestAnimationFrame(render);
+  </script>
+</body>
+</html>
